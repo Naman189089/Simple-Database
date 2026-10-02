@@ -54,7 +54,11 @@ typedef enum
 {
     PREPARE_SUCCESS,
     PREPARE_UNRECOGNIZED_STATEMENT,
-    PREPARE_SYNTAX_ERROR
+    PREPARE_SYNTAX_ERROR,
+    PREPARE_STRING_TOO_LONG,
+    PREPARE_TOO_MANY_ARGUMENTS,
+    PREPARE_TOO_FEW_ARGUMENTS,
+    PREPARE_NEGATIVE_ID
 } PreparedStatementResult;
 
 typedef enum
@@ -66,8 +70,8 @@ typedef enum
 typedef struct
 {
     uint32_t id;
-    char username[max_username_length];
-    char email[max_email_length];
+    char username[max_username_length + 1];
+    char email[max_email_length + 1];
 } Row;
 
 typedef struct
@@ -255,11 +259,57 @@ PreparedStatementResult prepare_statement(InputBuffer* input_buffer, Statement* 
     }
     else if (strncmp(input_buffer->buffer, "insert", 6) == 0 && (input_buffer->buffer[6] == ' '))
     {
-        char temp;
-        int values = sscanf(input_buffer->buffer, "insert %d %s %s %c", &(stmt->Row_data_when_insert.id), stmt->Row_data_when_insert.username, stmt->Row_data_when_insert.email, &temp);
-        if (values != 3)
+        //first word is always insert
+        int args_count = 1;
+        char* token = strtok(input_buffer->buffer, " ");
+        //step past "insert" to get the ID
+        token = strtok(NULL, " ");
+        while (token != NULL)
         {
-            return PREPARE_SYNTAX_ERROR;
+            args_count++;
+            if (args_count == 2)
+            {
+                int id = atoi(token);
+                if (id < 0)
+                {
+                    return PREPARE_NEGATIVE_ID;
+                }
+                else
+                {
+                    stmt->Row_data_when_insert.id = id;
+                }
+            }
+            else if (args_count == 3)
+            {
+                if (strlen(token) > max_username_length)
+                {
+                    return PREPARE_STRING_TOO_LONG;
+                }
+                else
+                {
+                    strcpy(stmt->Row_data_when_insert.username, token);
+                }
+            }
+            else if (args_count == 4)
+            {
+                if (strlen(token) > max_email_length)
+                {
+                    return PREPARE_STRING_TOO_LONG;
+                }
+                else
+                {
+                    strcpy(stmt->Row_data_when_insert.email, token);
+                }
+            }
+            else
+            {
+                return PREPARE_TOO_MANY_ARGUMENTS;
+            }
+            token = strtok(NULL, " ");
+        }
+        if (args_count < 4) 
+        {
+            return PREPARE_TOO_FEW_ARGUMENTS; 
         }
         stmt->type = STATEMENT_INSERT;
         return PREPARE_SUCCESS;
@@ -310,7 +360,7 @@ int main(int argc, char* argv[])
             ExecuteResult exec_result = execute_statement(&stmt, table);
             if (exec_result == EXECUTE_SUCCESS)
             {
-                printf("Executed\n");
+                printf("Executed.\n");
             }
             else if (exec_result == EXECUTE_TABLE_FULL)
             {
@@ -324,6 +374,22 @@ int main(int argc, char* argv[])
         else if (prepare_res == PREPARE_SYNTAX_ERROR)
         {
             printf("Syntax error. Could not parse statement.\n");
+        }
+        else if (prepare_res == PREPARE_STRING_TOO_LONG)
+        {
+            printf("String is too long.\n");
+        }
+        else if (prepare_res == PREPARE_TOO_MANY_ARGUMENTS)
+        {
+            printf("Too many arguments.\n");
+        }
+        else if (prepare_res == PREPARE_TOO_FEW_ARGUMENTS)
+        {
+            printf("Too few arguments.\n");
+        }
+        else if (prepare_res == PREPARE_NEGATIVE_ID)
+        {
+            printf("ID must be positive.\n");
         }
     }   
 }
