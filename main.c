@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 ////////////////////////////////////////////////////// Storage header and Structs and Enums /////////////////////////////////////////////////////////////////
 
@@ -25,24 +27,24 @@
 
 //assuming only 100 pages in tables
 #define max_pages_in_table 100
+#define max_filename_size 100
+
+
+typedef struct
+{
+    void* cache_of_pages[max_pages_in_table];
+    FILE* file_descriptor;
+    char* filename;
+} Pager;
 
 
 typedef struct
 {
     int num_rows;
-    void* pages[max_pages_in_table];
+    Pager pager;
+    // void* pages[max_pages_in_table];
 } Table;
 
-Table* table_initializer()
-{
-    Table* table = (Table *)malloc(sizeof(Table));
-    table->num_rows = 0;
-    for(int i = 0; i < max_pages_in_table; i++)
-    {
-        table->pages[i] = NULL;
-    }
-    return table;
-}
 
 typedef enum
 {
@@ -74,6 +76,7 @@ typedef struct
     char email[max_email_length + 1];
 } Row;
 
+
 typedef struct
 {
     StatementType type;
@@ -94,7 +97,94 @@ typedef struct
     ssize_t input_length;
 } InputBuffer;
 
+long get_file_size(FILE *file) 
+{
+    if (file == NULL) 
+    return 0;
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    return size;
+}
 
+Table* table_initializer(char* filename)
+{
+    // 1. Safety check for malloc
+    Table* table = (Table *)malloc(sizeof(Table));
+    if (table == NULL)
+    return NULL;
+
+    table->pager.filename = (char *)malloc(max_filename_size * sizeof(char));
+    if (table->pager.filename == NULL) 
+    {
+        free(table);
+        return NULL;
+    }
+
+    strncpy(table->pager.filename, filename, max_filename_size - 1);
+    table->pager.filename[max_filename_size - 1] = '\0';
+
+    table->pager.file_descriptor = fopen(table->pager.filename, "rb+");
+    if (table->pager.file_descriptor == NULL) 
+    {
+        table->pager.file_descriptor = fopen(table->pager.filename, "wb+");
+        if (table->pager.file_descriptor == NULL) 
+        {
+            perror("Error creating file");
+            free(table->pager.filename);
+            free(table);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    table->num_rows = get_file_size(table->pager.file_descriptor) / row_size;
+    for(int i = 0; i < max_pages_in_table; i++)
+    {
+        //cold start of cache
+        table->pager.cache_of_pages[i] = NULL;
+    }
+    return table;
+}
+
+
+//////////////////////////////////////////////////////// Persistence code ////////////////////////////////////////////////////////
+
+
+int bring_page_into_memory(int page_index, Table* table, void* page_buffer)
+{
+    long offset_in_file = page_index * page_size;
+    if (offset_in_file > get_file_size(table->pager.file_descriptor))
+    return 0;
+    
+    fseek(table->pager.file_descriptor, offset_in_file, SEEK_SET);
+
+    ssize_t bytes_read = fread(page_buffer, 1, page_size, table->pager.file_descriptor);
+
+    if (ferror(table->pager.file_descriptor)) 
+    {
+        perror("Error reading from file");
+        return 0;
+    }
+    return 1;
+}
+
+int update_file(int page_number, Table* table, size_t size_to_write)
+{
+    long offset_in_file = page_number * page_size;
+    void* offset_in_cache = table->pager.cache_of_pages[page_number];
+    if (fseek(table->pager.file_descriptor, offset_in_file, SEEK_SET) != 0) 
+    {
+        perror("Fseek to file_offset failed");
+        return 0;
+    }
+    size_t bytes_written = fwrite(offset_in_cache, 1, size_to_write, table->pager.file_descriptor);
+    if (bytes_written < size_to_write) {
+        perror("Error writing page to disk (incomplete write)");
+        return 0;
+    }
+    fflush(table->pager.file_descriptor);
+    return 1;
+}
 
 ///////////////////////////////////////////////////////////////// IO //////////////////////////////////////////////////////////////
 
@@ -119,6 +209,7 @@ void getInput(InputBuffer* input_buffer)
     ssize_t size = getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
     if (size > 0)
     {
+        if (input_buffer->buffer[size - 1] == '\n')
         size--;
         input_buffer->input_length = size;
         input_buffer->buffer[size] = 0;
@@ -145,8 +236,6 @@ void close_input_buffer(InputBuffer* input_buffer)
 }
 
 
-
-
 /////////////////////////////////////////////////////////////// Storage and insert ////////////////////////////////////////////////////////////
 
 
@@ -171,25 +260,22 @@ ExecuteResult execute_insert(Statement* stmt, Table* table)
     {
         //find out teh page index
         int page_index = table->num_rows / max_rows_in_page;
-
-        //malloc another page in this table
-        if (table->pages[page_index] == NULL)
+        if (table->pager.cache_of_pages[page_index] == NULL)
         {
-            table->pages[page_index] = malloc(page_size);
+            void* page_buffer = calloc(1, page_size);
+            bring_page_into_memory(page_index, table, page_buffer);
+            table->pager.cache_of_pages[page_index] = page_buffer;
         }
-
         //find out teh row index within the page and the offset to where we need to copy to.
         int row_offset = table->num_rows % max_rows_in_page;
         uint32_t byte_offset = row_offset * row_size;
-        void* destination_pointer = byte_offset + (char *)table->pages[page_index];
+        void* destination_pointer = byte_offset + (char *)table->pager.cache_of_pages[page_index];
         copy_row_data_from_stmt_to_table(&(stmt->Row_data_when_insert), destination_pointer);
 
         table->num_rows++;
         return EXECUTE_SUCCESS;
     }
 }
-
-
 
 
 ///////////////////////////////////////////////////////// Select ///////////////////////////////////////////////////////////////
@@ -216,13 +302,16 @@ ExecuteResult execute_select(Statement* stmt, Table* table)
     for(u_int32_t i = 0; i < table->num_rows; i++)
     {
         int page_index = i / max_rows_in_page;
-        if (table->pages[page_index] == NULL)
+        //page not present in cache, I have to bring it to memory and then assign it
+        if (table->pager.cache_of_pages[page_index] == NULL)
         {
-            table->pages[page_index] = malloc(page_size);
+            void* page_buffer = calloc(1, page_size);
+            bring_page_into_memory(page_index, table, page_buffer);
+            table->pager.cache_of_pages[page_index] = page_buffer;
         }
         int row_offset = i % max_rows_in_page;
         uint32_t byte_offset = row_offset * row_size;
-        void* source_pointer = byte_offset + (char *)table->pages[page_index];
+        void* source_pointer = byte_offset + (char *)table->pager.cache_of_pages[page_index];
 
         copy_row_data_from_table_to_temp_to_print(&temp_to_print, source_pointer);
 
@@ -232,15 +321,49 @@ ExecuteResult execute_select(Statement* stmt, Table* table)
 }
 
 
-
-
 //////////////////////////////////////////////////////////////////////// execution ////////////////////////////////////////////
 
 
-MetaCommandResult do_command(InputBuffer* input_buffer)
+MetaCommandResult do_command(InputBuffer* input_buffer, Table* table)
 {
     if (strcmp(input_buffer->buffer, ".exit") == 0)
     {
+        int num_full_pages = table->num_rows / max_rows_in_page;
+        for(int i = 0; i < num_full_pages; i++)
+        {
+            if (table->pager.cache_of_pages[i] != NULL)
+            {
+                if (update_file(i, table, page_size) == 0)
+                exit(EXIT_FAILURE);
+                free(table->pager.cache_of_pages[i]);
+                table->pager.cache_of_pages[i] = NULL;
+            }
+        }
+        int additional_row = table->num_rows % max_rows_in_page;
+        if (additional_row > 0)
+        {
+            int page_number = num_full_pages;
+            if (table->pager.cache_of_pages[page_number] != NULL)
+            {
+                size_t size_to_write = additional_row * row_size;
+                if (update_file(page_number, table, size_to_write) == 0)
+                exit(EXIT_FAILURE);
+                free(table->pager.cache_of_pages[page_number]);
+                table->pager.cache_of_pages[page_number] = NULL;
+            }
+        }
+        if (table->pager.file_descriptor != NULL) 
+        {
+            if (fclose(table->pager.file_descriptor) != 0)
+            perror("Error closing database file");
+            table->pager.file_descriptor = NULL; 
+        }
+        if (table->pager.filename != NULL) 
+        {
+            free(table->pager.filename);
+            table->pager.filename = NULL;
+        }
+        free(table);
         close_input_buffer(input_buffer);
         exit(EXIT_SUCCESS);
     }
@@ -328,15 +451,20 @@ ExecuteResult execute_statement(Statement* stmt, Table* table)
     {
         return execute_insert(stmt, table);
     }
-}
 
+}
 
 
 /////////////////////////////////////////////////////////// Main ///////////////////////////////////////////////////////////////
 
 int main(int argc, char* argv[])
 {
-    Table* table = table_initializer();
+    if (argc != 2)
+    {
+        printf("Please provide the file name");
+        return 0;
+    }
+    Table* table = table_initializer(argv[1]);
     InputBuffer* input_buffer = input_buffer_initializer();
     while (true)
     {
@@ -344,7 +472,7 @@ int main(int argc, char* argv[])
         getInput(input_buffer);
         if (input_buffer->buffer[0] == '.')
         {
-            MetaCommandResult command_res = do_command(input_buffer);
+            MetaCommandResult command_res = do_command(input_buffer, table);
             if (command_res == META_COMMAND_SUCCESS)
             continue;
             else if (command_res == META_COMMAND_UNRECOGNIZED_COMMAND)
